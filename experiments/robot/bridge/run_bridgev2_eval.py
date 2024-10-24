@@ -33,6 +33,66 @@ from experiments.robot.robot_utils import (
     get_model,
 )
 
+import simplejpeg
+from PIL import Image
+import numpy as np
+import requests
+import pickle
+
+
+def _resize_with_pad_pil(image: Image.Image, height: int, width: int, method: int) -> Image.Image:
+    """Replicates tf.image.resize_with_pad for one image using PIL. Resizes an image to a target height and
+    width without distortion by padding with zeros.
+
+    Unlike the jax version, note that PIL uses [width, height, channel] ordering instead of [batch, h, w, c].
+    """
+    cur_width, cur_height = image.size
+    if cur_width == width and cur_height == height:
+        return image  # No need to resize if the image is already the correct size.
+
+    ratio = max(cur_width / width, cur_height / height)
+    resized_height = int(cur_height / ratio)
+    resized_width = int(cur_width / ratio)
+    resized_image = image.resize((resized_width, resized_height), resample=method)
+
+    zero_image = Image.new(resized_image.mode, (width, height), 0)
+    pad_height = max(0, int((height - resized_height) / 2))
+    pad_width = max(0, int((width - resized_width) / 2))
+    zero_image.paste(resized_image, (pad_width, pad_height))
+    assert zero_image.size == (width, height)
+    return zero_image
+
+
+def resize_with_pad(images: np.ndarray, height: int, width: int, method=Image.BILINEAR) -> np.ndarray:
+    """Replicates tf.image.resize_with_pad for multiple images using PIL. Resizes a batch of images to a target height.
+
+    Args:
+        images: A batch of images in [..., height, width, channel] format.
+        height: The target height of the image.
+        width: The target width of the image.
+        method: The interpolation method to use. Default is bilinear.
+
+    Returns:
+        The resized images in [..., height, width, channel].
+    """
+    # If the images are already the correct size, return them as is.
+    if images.shape[-3:-1] == (height, width):
+        return images
+
+    original_shape = images.shape
+
+    images = images.reshape(-1, *original_shape[-3:])
+    resized = np.stack([_resize_with_pad_pil(Image.fromarray(im), height, width, method=method) for im in images])
+    return resized.reshape(*original_shape[:-3], *resized.shape[-3:])
+
+def _make_request(uri: str, element):
+    response = requests.post(uri, data=pickle.dumps(element))
+    if response.status_code != 200:
+        raise Exception(response.text)
+
+    action = pickle.loads(response.content)
+    return action["action/action"][0]    # remove batch dim
+
 
 @dataclass
 class GenerateConfig:
@@ -65,10 +125,10 @@ class GenerateConfig:
 
     camera_topics: List[Dict[str, str]] = field(default_factory=lambda: [{"name": "/blue/image_raw"}])
 
-    blocking: bool = False                                      # Whether to use blocking control
+    blocking: bool = True                                      # Whether to use blocking control
     max_episodes: int = 50                                      # Max number of episodes to run
-    max_steps: int = 60                                         # Max number of timesteps per episode
-    control_frequency: float = 5                                # WidowX control frequency
+    max_steps: int = 160                                         # Max number of timesteps per episode
+    control_frequency: float = 2.5                                # WidowX control frequency
 
     #################################################################################################################
     # Utils
@@ -87,7 +147,8 @@ def eval_model_in_bridge_env(cfg: GenerateConfig) -> None:
     cfg.unnorm_key = "bridge_orig"
 
     # Load model
-    model = get_model(cfg)
+    # model = get_model(cfg)
+    model = None
 
     # [OpenVLA] Get Hugging Face processor
     processor = None
@@ -138,16 +199,37 @@ def eval_model_in_bridge_env(cfg: GenerateConfig) -> None:
                     replay_images.append(obs["full_image"])
 
                     # Get preprocessed image
-                    obs["full_image"] = get_preprocessed_image(obs, resize_size)
+                    # obs["full_image"] = get_preprocessed_image(obs, resize_size)
 
-                    # Query model to get action
-                    action = get_action(
-                        cfg,
-                        model,
-                        obs,
-                        task_label,
-                        processor=processor,
-                    )
+                    # # Query model to get action
+                    # action = get_action(
+                    #     cfg,
+                    #     model,
+                    #     obs,
+                    #     task_label,
+                    #     processor=processor,
+                    # )
+
+                    bridge_image = obs["full_image"]
+                    bridge_state = obs["proprio"]
+                    bridge_instruction = task_label
+                    #obs_image = resize_with_pad(bridge_image, 256, 320)
+                    # obs_image = resize_with_pad(resize_with_pad(bridge_image, 256, 256), 256, 320)
+                    obs_image = resize_with_pad(resize_with_pad(bridge_image, 256, 256), 224, 224)
+                    
+                    element = {
+                        "observation/image_0": np.array(obs_image),  # bridge_image is 256x256,
+                        "observation/image_0_mask": np.array(True),
+                        # "observation/image_1": np.zeros((256, 320, 3), dtype=np.uint8),
+                        "observation/image_1": np.zeros((224, 224, 3), dtype=np.uint8),
+                        "observation/image_1_mask": np.array(False),
+                        "observation/state": bridge_state[:-1],   # we zero out the state for this model
+                        "raw_text": bridge_instruction,     # a simple string
+                    }
+                    # Image.fromarray(element["observation/image_0"]).save(f"/tmp/images/{int(time.time())}.jpeg")
+
+                    # this returns action chunk [4, 7] of 4 eef velocity actions (6) + gripper delta (1)
+                    action = _make_request("http://0.0.0.0:8000/infer", element)
 
                     # [If saving rollout data] Save preprocessed image, robot state, and action
                     if cfg.save_data:
@@ -164,11 +246,11 @@ def eval_model_in_bridge_env(cfg: GenerateConfig) -> None:
                 if isinstance(e, KeyboardInterrupt):
                     print("\nCaught KeyboardInterrupt: Terminating episode early.")
                 else:
-                    print(f"\nCaught exception: {e}")
+                    raise e
                 break
 
         # Save a replay video of the episode
-        save_rollout_video(replay_images, episode_idx)
+        # save_rollout_video(replay_images, episode_idx)
 
         # [If saving rollout data] Save rollout data
         if cfg.save_data:
