@@ -91,7 +91,8 @@ def _make_request(uri: str, element):
         raise Exception(response.text)
 
     action = pickle.loads(response.content)
-    return action["action/action"][0]    # remove batch dim
+    # print(f"model output: {action}")
+    return action["actions"]
 
 
 @dataclass
@@ -127,7 +128,7 @@ class GenerateConfig:
 
     blocking: bool = True                                      # Whether to use blocking control
     max_episodes: int = 50                                      # Max number of episodes to run
-    max_steps: int = 160                                         # Max number of timesteps per episode
+    max_steps: int = 200                                         # Max number of timesteps per episode
     control_frequency: float = 2.5                                # WidowX control frequency
 
     #################################################################################################################
@@ -187,49 +188,58 @@ def eval_model_in_bridge_env(cfg: GenerateConfig) -> None:
         while t < cfg.max_steps:
             try:
                 curr_tstamp = time.time()
-                if curr_tstamp > last_tstamp + step_duration:
-                    print(f"t: {t}")
-                    print(f"Previous step elapsed time (sec): {curr_tstamp - last_tstamp:.2f}")
-                    last_tstamp = time.time()
+                if (curr_tstamp > last_tstamp + step_duration):
+                    if t % 5 == 0:
+                        print(f"t: {t}")
+                        print(f"Previous step elapsed time (sec): {curr_tstamp - last_tstamp:.2f}")
+                        last_tstamp = time.time()
 
-                    # Refresh the camera image and proprioceptive state
-                    obs = refresh_obs(obs, env)
+                        # Refresh the camera image and proprioceptive state
+                        obs = refresh_obs(obs, env)
 
-                    # Save full (not preprocessed) image for replay video
-                    replay_images.append(obs["full_image"])
+                        # Save full (not preprocessed) image for replay video
+                        replay_images.append(obs["full_image"])
 
-                    # Get preprocessed image
-                    # obs["full_image"] = get_preprocessed_image(obs, resize_size)
+                        #################### OPENVLA ####################
+                        # Get preprocessed image
+                        # obs["full_image"] = get_preprocessed_image(obs, resize_size)
 
-                    # # Query model to get action
-                    # action = get_action(
-                    #     cfg,
-                    #     model,
-                    #     obs,
-                    #     task_label,
-                    #     processor=processor,
-                    # )
+                        # # Query model to get action
+                        # action = get_action(
+                        #     cfg,
+                        #     model,
+                        #     obs,
+                        #     task_label,
+                        #     processor=processor,
+                        # )
+                        ##################################################
 
-                    bridge_image = obs["full_image"]
-                    bridge_state = obs["proprio"]
-                    bridge_instruction = task_label
-                    #obs_image = resize_with_pad(bridge_image, 256, 320)
-                    # obs_image = resize_with_pad(resize_with_pad(bridge_image, 256, 256), 256, 320)
-                    obs_image = resize_with_pad(resize_with_pad(bridge_image, 256, 256), 224, 224)
+                        bridge_image = obs["full_image"]
+                        bridge_state = obs["proprio"]
+                        bridge_instruction = task_label
+                        #obs_image = resize_with_pad(bridge_image, 256, 320)
+                        # obs_image = resize_with_pad(resize_with_pad(bridge_image, 256, 256), 256, 320)
+                        bridge_resized = Image.fromarray(bridge_image).resize((256, 256))
+                        obs_image = resize_with_pad(np.array(bridge_resized), 224, 224)
+                        # obs_image = resize_with_pad(np.array(bridge_resized), 256, 320)
+                        
+                        element = {
+                            "observation/image_0": np.array(obs_image),  # bridge_image is 256x256,
+                            "observation/image_0_mask": np.array(True),
+                            # "observation/image_1": np.zeros((256, 320, 3), dtype=np.uint8),
+                            "observation/image_1": np.zeros((224, 224, 3), dtype=np.uint8),
+                            "observation/image_1_mask": np.array(False),
+                            "observation/state": bridge_state[:-1],   # we zero out the state for this model
+                            "raw_text": bridge_instruction,     # a simple string
+                        }
+                        # Image.fromarray(element["observation/image_0"]).save(f"/tmp/images/{int(time.time())}.jpeg")
+
+                        # this returns action chunk [4, 7] of 4 eef velocity actions (6) + gripper delta (1)
+                        actions = _make_request("http://0.0.0.0:8000/infer", element)
+                        action = actions[0]
+                    else:
+                        action = actions[t % 5]
                     
-                    element = {
-                        "observation/image_0": np.array(obs_image),  # bridge_image is 256x256,
-                        "observation/image_0_mask": np.array(True),
-                        # "observation/image_1": np.zeros((256, 320, 3), dtype=np.uint8),
-                        "observation/image_1": np.zeros((224, 224, 3), dtype=np.uint8),
-                        "observation/image_1_mask": np.array(False),
-                        "observation/state": bridge_state[:-1],   # we zero out the state for this model
-                        "raw_text": bridge_instruction,     # a simple string
-                    }
-                    # Image.fromarray(element["observation/image_0"]).save(f"/tmp/images/{int(time.time())}.jpeg")
-
-                    # this returns action chunk [4, 7] of 4 eef velocity actions (6) + gripper delta (1)
-                    action = _make_request("http://0.0.0.0:8000/infer", element)
 
                     # [If saving rollout data] Save preprocessed image, robot state, and action
                     if cfg.save_data:
